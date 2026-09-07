@@ -112,14 +112,13 @@ func NewUnavailableError(message string) *ServiceError {
 func IsCallbackRetryable(err error) bool {
 	var svcErr *ServiceError
 	if !errors.As(err, &svcErr) {
-		return true
+		return false
 	}
 	switch svcErr.Code {
-	case ErrCodeValidation, ErrCodeNotFound, ErrCodeConflict,
-		ErrCodePolicyRejected, ErrCodePolicyConflict, ErrCodeProvisioningError:
-		return false
-	default:
+	case ErrCodeInternal, ErrCodeUnavailable, ErrCodeSPRMError, ErrCodePolicyInternalError:
 		return true
+	default:
+		return false
 	}
 }
 

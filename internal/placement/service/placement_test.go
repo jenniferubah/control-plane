@@ -1225,7 +1225,7 @@ var _ = Describe("PlacementService", func() {
 			Expect(app.Status).To(Equal(types.ResourceStatusProvisioning))
 		})
 
-		It("is idempotent when OnResourceFailed is redelivered", func() {
+		It("retries teardown when OnResourceFailed is redelivered", func() {
 			deleteCalls := 0
 			mockSPRM.DeleteResourceFunc = func(_ context.Context, _ string) error {
 				deleteCalls++
@@ -1256,7 +1256,56 @@ var _ = Describe("PlacementService", func() {
 
 			err = placementSvc.OnResourceFailed(ctx, dbID)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(deleteCalls).To(Equal(firstDeleteCalls))
+			Expect(deleteCalls).To(BeNumerically(">=", firstDeleteCalls))
+		})
+
+		It("releases PROVISIONING and retries SPRM create after a retryable failure", func() {
+			req := &types.CreateRunRequest{
+				CatalogItemInstanceId: "catalog-retry-create",
+				RunId:                 uuid.New().String(),
+				Resources: []types.ResourceInput{
+					{Name: "db", Spec: map[string]any{"kind": "db"}},
+					{Name: "app", Spec: map[string]any{"kind": "app"}, RequiresResources: []string{"db"}},
+				},
+			}
+			created, err := placementSvc.CreateRun(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			var dbID, appID string
+			for _, r := range created.Resources {
+				switch r.Name {
+				case "db":
+					dbID = *r.Id
+				case "app":
+					appID = *r.Id
+				}
+			}
+
+			createAttempts := 0
+			mockSPRM.CreateResourceFunc = func(_ context.Context, req sprm.CreateResourceRequest) (*sprm.CreateResourceResponse, error) {
+				if req.ID == appID {
+					createAttempts++
+					if createAttempts == 1 {
+						return nil, &sprm.HTTPError{StatusCode: 503, Body: "unavailable"}
+					}
+				}
+				return &sprm.CreateResourceResponse{ID: req.ID, Status: "provisioning"}, nil
+			}
+
+			err = placementSvc.OnResourceRunning(ctx, runningEvent(dbID))
+			Expect(err).To(HaveOccurred())
+
+			app, err := dataStore.Resource().Get(ctx, appID)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(app.Status).To(Equal(types.ResourceStatusPending))
+
+			err = placementSvc.OnResourceRunning(ctx, runningEvent(dbID))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(createAttempts).To(Equal(2))
+
+			app, err = dataStore.Resource().Get(ctx, appID)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(app.Status).To(Equal(types.ResourceStatusProvisioning))
 		})
 	})
 

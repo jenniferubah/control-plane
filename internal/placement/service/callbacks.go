@@ -125,6 +125,9 @@ func (s *PlacementService) OnResourceRunning(ctx context.Context, event types.Re
 
 		availableAgents, err := s.listAvailableAgents(ctx)
 		if err != nil {
+			if IsCallbackRetryable(err) {
+				releaseProvisioningClaim(ctx, s.store.Resource(), r.ID)
+			}
 			return err
 		}
 
@@ -132,10 +135,17 @@ func (s *PlacementService) OnResourceRunning(ctx context.Context, event types.Re
 		// current policy state and the bound spec.
 		evaluated, err := s.evaluateResourcePolicy(ctx, r.ID, boundSpec, availableAgents)
 		if err != nil {
+			if IsCallbackRetryable(err) {
+				releaseProvisioningClaim(ctx, s.store.Resource(), r.ID)
+			}
 			return err
 		}
 		if err := s.store.Resource().UpdatePlacementDecision(ctx, r.ID, evaluated.SelectedAgent, evaluated.Status); err != nil {
-			return NewInternalError(fmt.Sprintf("failed to update placement decision for resource %s: %v", r.ID, err))
+			svcErr := NewInternalError(fmt.Sprintf("failed to update placement decision for resource %s: %v", r.ID, err))
+			if IsCallbackRetryable(svcErr) {
+				releaseProvisioningClaim(ctx, s.store.Resource(), r.ID)
+			}
+			return svcErr
 		}
 
 		// Step 7: Provision via SPRM using the evaluated spec (not the raw stored spec).
@@ -157,7 +167,11 @@ func (s *PlacementService) OnResourceRunning(ctx context.Context, event types.Re
 				"dag_level", r.DagLevel,
 				"error", err,
 			)
-			return handleSPRMError(err)
+			svcErr := handleSPRMError(err)
+			if IsCallbackRetryable(svcErr) {
+				releaseProvisioningClaim(ctx, s.store.Resource(), r.ID)
+			}
+			return svcErr
 		}
 	}
 	return nil
@@ -275,7 +289,11 @@ func (s *PlacementService) progressRunDeletion(ctx context.Context, runID string
 						return NewInternalError(fmt.Sprintf("failed to set DELETED status for resource %s: %v", r.ID, casErr))
 					}
 				} else {
-					return handleSPRMError(err)
+					svcErr := handleSPRMError(err)
+					if IsCallbackRetryable(svcErr) {
+						releaseDeletionDispatch(ctx, s.store.Resource(), r.ID)
+					}
+					return svcErr
 				}
 				continue
 			}
@@ -316,14 +334,33 @@ func (s *PlacementService) OnResourceFailed(ctx context.Context, resourceID stri
 			return NewInternalError(fmt.Sprintf("failed to reload resource %s after CAS: %v", resourceID, err))
 		}
 		switch resource.Status {
-		case types.ResourceStatusFailed,
-			types.ResourceStatusPendingDeletion,
-			types.ResourceStatusDeleting,
-			types.ResourceStatusDeleted:
+		case types.ResourceStatusFailed:
+			return s.DeleteRun(ctx, resource.RunID)
+		case types.ResourceStatusPendingDeletion, types.ResourceStatusDeleting:
+			return s.progressRunDeletion(ctx, resource.RunID)
+		case types.ResourceStatusDeleted:
 			return nil
 		default:
 			return nil
 		}
 	}
 	return s.DeleteRun(ctx, resource.RunID)
+}
+
+// releaseProvisioningClaim rolls a failed create progression back to PENDING so
+// a redelivered RUNNING callback can retry SPRM dispatch.
+func releaseProvisioningClaim(ctx context.Context, resources store.Resource, resourceID string) {
+	_, _ = resources.UpdateStatusFrom(ctx, resourceID,
+		[]string{types.ResourceStatusProvisioning},
+		types.ResourceStatusPending,
+	)
+}
+
+// releaseDeletionDispatch rolls a failed SPRM delete back to PENDING_DELETION so
+// progressRunDeletion can redispatch on the next callback.
+func releaseDeletionDispatch(ctx context.Context, resources store.Resource, resourceID string) {
+	_, _ = resources.UpdateStatusFrom(ctx, resourceID,
+		[]string{types.ResourceStatusDeleting},
+		types.ResourceStatusPendingDeletion,
+	)
 }

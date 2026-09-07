@@ -22,6 +22,9 @@ import (
 
 const healthFlushTimeout = 2 * time.Second
 
+// defaultStatusMaxDeliver caps redelivery when placement callbacks keep failing.
+const defaultStatusMaxDeliver = 10
+
 // StatusEvent represents a status event payload.
 type StatusEvent struct {
 	Id         string         `json:"id"`
@@ -118,8 +121,9 @@ func (c *StatusConsumer) Start(ctx context.Context) error {
 	}
 
 	cons, err := stream.CreateOrUpdateConsumer(ctx, jetstream.ConsumerConfig{
-		Durable:   c.consumerName,
-		AckPolicy: jetstream.AckExplicitPolicy,
+		Durable:    c.consumerName,
+		AckPolicy:  jetstream.AckExplicitPolicy,
+		MaxDeliver: defaultStatusMaxDeliver,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create/update consumer %s: %w", c.consumerName, err)
