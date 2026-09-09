@@ -477,7 +477,7 @@ var _ = Describe("PlacementService", func() {
 			var svcErr *service.ServiceError
 			Expect(err).To(BeAssignableToTypeOf(svcErr))
 			svcErr = err.(*service.ServiceError)
-			Expect(svcErr.Code).To(Equal(service.ErrCodePolicyError))
+			Expect(svcErr.Code).To(Equal(service.ErrCodePolicyInternalError))
 			Expect(svcErr.Message).To(ContainSubstring("policy client communication error"))
 			Expect(svcErr.Message).To(ContainSubstring("connection refused"))
 		})
@@ -993,6 +993,16 @@ var _ = Describe("PlacementService", func() {
 			Expect(err).To(BeAssignableToTypeOf(svcErr))
 			svcErr = err.(*service.ServiceError)
 			Expect(svcErr.Code).To(Equal(service.ErrCodeValidation))
+
+			var appID string
+			for _, r := range created.Resources {
+				if r.Name == "app" {
+					appID = *r.Id
+				}
+			}
+			app, err := dataStore.Resource().Get(ctx, appID)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(app.Status).To(Equal(types.ResourceStatusPending))
 		})
 
 		It("returns an SPRM error when GetOutputSpec fails", func() {
@@ -1306,6 +1316,85 @@ var _ = Describe("PlacementService", func() {
 			app, err = dataStore.Resource().Get(ctx, appID)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(app.Status).To(Equal(types.ResourceStatusProvisioning))
+		})
+
+		It("releases PROVISIONING after a terminal SPRM create error", func() {
+			req := &types.CreateRunRequest{
+				CatalogItemInstanceId: "catalog-terminal-create",
+				RunId:                 uuid.New().String(),
+				Resources: []types.ResourceInput{
+					{Name: "db", Spec: map[string]any{"kind": "db"}},
+					{Name: "app", Spec: map[string]any{"kind": "app"}, RequiresResources: []string{"db"}},
+				},
+			}
+			created, err := placementSvc.CreateRun(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			var dbID, appID string
+			for _, r := range created.Resources {
+				switch r.Name {
+				case "db":
+					dbID = *r.Id
+				case "app":
+					appID = *r.Id
+				}
+			}
+
+			mockSPRM.CreateResourceFunc = func(_ context.Context, req sprm.CreateResourceRequest) (*sprm.CreateResourceResponse, error) {
+				if req.ID == appID {
+					return nil, &sprm.HTTPError{StatusCode: http.StatusUnprocessableEntity, Body: "invalid spec"}
+				}
+				return &sprm.CreateResourceResponse{ID: req.ID, Status: "provisioning"}, nil
+			}
+
+			err = placementSvc.OnResourceRunning(ctx, runningEvent(dbID))
+			Expect(err).To(HaveOccurred())
+
+			app, err := dataStore.Resource().Get(ctx, appID)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(app.Status).To(Equal(types.ResourceStatusPending))
+		})
+
+		It("rolls DELETING back to PENDING_DELETION after a retryable SPRM delete failure and retries on redelivery", func() {
+			req := &types.CreateRunRequest{
+				CatalogItemInstanceId: "catalog-retry-delete",
+				RunId:                 uuid.New().String(),
+				Resources: []types.ResourceInput{
+					{Name: "db", Spec: map[string]any{"kind": "db"}},
+					{Name: "app", Spec: map[string]any{"kind": "app"}, RequiresResources: []string{"db"}},
+				},
+			}
+			created, err := placementSvc.CreateRun(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			var appID string
+			for _, r := range created.Resources {
+				if r.Name == "app" {
+					appID = *r.Id
+				}
+			}
+
+			deleteAttempts := 0
+			mockSPRM.DeleteResourceFunc = func(_ context.Context, resourceID string) error {
+				if resourceID == appID {
+					deleteAttempts++
+					if deleteAttempts == 1 {
+						return &sprm.HTTPError{StatusCode: http.StatusServiceUnavailable, Body: "unavailable"}
+					}
+				}
+				return nil
+			}
+
+			err = placementSvc.DeleteRun(ctx, created.RunId)
+			Expect(err).To(HaveOccurred())
+
+			app, err := dataStore.Resource().Get(ctx, appID)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(app.Status).To(Equal(types.ResourceStatusPendingDeletion))
+
+			err = placementSvc.DeleteRun(ctx, created.RunId)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(deleteAttempts).To(Equal(2))
 		})
 	})
 

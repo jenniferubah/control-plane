@@ -156,8 +156,8 @@ func handlePolicyError(err error) *ServiceError {
 		}
 	}
 
-	// Network or client communication error - not an HTTP error from policy engine
-	return NewPolicyError("policy client communication error: " + err.Error())
+	// Network or client communication error - treat as transient for callback retry.
+	return NewPolicyInternalError("policy client communication error: " + err.Error())
 }
 
 // handleSPRMError maps SPRM client errors to service errors by checking

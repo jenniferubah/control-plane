@@ -86,23 +86,6 @@ func (s *PlacementService) OnResourceRunning(ctx context.Context, event types.Re
 		return handleSPRMError(err)
 	}
 	for _, r := range ready {
-		// Claim the target so redelivered RUNNING callbacks cannot issue a second SPRM create.
-		claimed, err := s.store.Resource().UpdateStatusFrom(ctx, r.ID,
-			[]string{types.ResourceStatusPending},
-			types.ResourceStatusProvisioning,
-		)
-		if err != nil {
-			return NewInternalError(fmt.Sprintf("failed to claim resource %s for provisioning: %v", r.ID, err))
-		}
-		if !claimed {
-			log.Debug("Skipping duplicate DAG progression for resource already claimed",
-				"run_id", r.RunID,
-				"resource_id", r.ID,
-				"name", r.Name,
-			)
-			continue
-		}
-
 		refs, err := cel.CollectReferences(r.Spec)
 		if err != nil {
 			return NewValidationError(fmt.Sprintf("resource %s: %v", r.Name, err))
@@ -123,10 +106,28 @@ func (s *PlacementService) OnResourceRunning(ctx context.Context, event types.Re
 			return NewValidationError(fmt.Sprintf("resource %s: %v", r.Name, err))
 		}
 
+		// Claim after validation so a terminal CEL error leaves the resource PENDING,
+		// matching pre-CAS behavior. PROVISIONING is a placement-side CAS lock only.
+		claimed, err := s.store.Resource().UpdateStatusFrom(ctx, r.ID,
+			[]string{types.ResourceStatusPending},
+			types.ResourceStatusProvisioning,
+		)
+		if err != nil {
+			return NewInternalError(fmt.Sprintf("failed to claim resource %s for provisioning: %v", r.ID, err))
+		}
+		if !claimed {
+			log.Debug("Skipping duplicate DAG progression for resource already claimed",
+				"run_id", r.RunID,
+				"resource_id", r.ID,
+				"name", r.Name,
+			)
+			continue
+		}
+
 		availableAgents, err := s.listAvailableAgents(ctx)
 		if err != nil {
-			if IsCallbackRetryable(err) {
-				releaseProvisioningClaim(ctx, s.store.Resource(), r.ID)
+			if rbErr := releaseProvisioningClaim(ctx, s.store.Resource(), r.ID); rbErr != nil {
+				logClaimRollbackFailure(log, "provisioning", r.ID, rbErr)
 			}
 			return err
 		}
@@ -135,17 +136,16 @@ func (s *PlacementService) OnResourceRunning(ctx context.Context, event types.Re
 		// current policy state and the bound spec.
 		evaluated, err := s.evaluateResourcePolicy(ctx, r.ID, boundSpec, availableAgents)
 		if err != nil {
-			if IsCallbackRetryable(err) {
-				releaseProvisioningClaim(ctx, s.store.Resource(), r.ID)
+			if rbErr := releaseProvisioningClaim(ctx, s.store.Resource(), r.ID); rbErr != nil {
+				logClaimRollbackFailure(log, "provisioning", r.ID, rbErr)
 			}
 			return err
 		}
 		if err := s.store.Resource().UpdatePlacementDecision(ctx, r.ID, evaluated.SelectedAgent, evaluated.Status); err != nil {
-			svcErr := NewInternalError(fmt.Sprintf("failed to update placement decision for resource %s: %v", r.ID, err))
-			if IsCallbackRetryable(svcErr) {
-				releaseProvisioningClaim(ctx, s.store.Resource(), r.ID)
+			if rbErr := releaseProvisioningClaim(ctx, s.store.Resource(), r.ID); rbErr != nil {
+				logClaimRollbackFailure(log, "provisioning", r.ID, rbErr)
 			}
-			return svcErr
+			return NewInternalError(fmt.Sprintf("failed to update placement decision for resource %s: %v", r.ID, err))
 		}
 
 		// Step 7: Provision via SPRM using the evaluated spec (not the raw stored spec).
@@ -167,11 +167,10 @@ func (s *PlacementService) OnResourceRunning(ctx context.Context, event types.Re
 				"dag_level", r.DagLevel,
 				"error", err,
 			)
-			svcErr := handleSPRMError(err)
-			if IsCallbackRetryable(svcErr) {
-				releaseProvisioningClaim(ctx, s.store.Resource(), r.ID)
+			if rbErr := releaseProvisioningClaim(ctx, s.store.Resource(), r.ID); rbErr != nil {
+				logClaimRollbackFailure(log, "provisioning", r.ID, rbErr)
 			}
-			return svcErr
+			return handleSPRMError(err)
 		}
 	}
 	return nil
@@ -290,8 +289,8 @@ func (s *PlacementService) progressRunDeletion(ctx context.Context, runID string
 					}
 				} else {
 					svcErr := handleSPRMError(err)
-					if IsCallbackRetryable(svcErr) {
-						releaseDeletionDispatch(ctx, s.store.Resource(), r.ID)
+					if rbErr := releaseDeletionDispatch(ctx, s.store.Resource(), r.ID); rbErr != nil {
+						logClaimRollbackFailure(log, "deletion", r.ID, rbErr)
 					}
 					return svcErr
 				}
@@ -345,22 +344,4 @@ func (s *PlacementService) OnResourceFailed(ctx context.Context, resourceID stri
 		}
 	}
 	return s.DeleteRun(ctx, resource.RunID)
-}
-
-// releaseProvisioningClaim rolls a failed create progression back to PENDING so
-// a redelivered RUNNING callback can retry SPRM dispatch.
-func releaseProvisioningClaim(ctx context.Context, resources store.Resource, resourceID string) {
-	_, _ = resources.UpdateStatusFrom(ctx, resourceID,
-		[]string{types.ResourceStatusProvisioning},
-		types.ResourceStatusPending,
-	)
-}
-
-// releaseDeletionDispatch rolls a failed SPRM delete back to PENDING_DELETION so
-// progressRunDeletion can redispatch on the next callback.
-func releaseDeletionDispatch(ctx context.Context, resources store.Resource, resourceID string) {
-	_, _ = resources.UpdateStatusFrom(ctx, resourceID,
-		[]string{types.ResourceStatusDeleting},
-		types.ResourceStatusPendingDeletion,
-	)
 }
